@@ -1,0 +1,207 @@
+package socks
+
+import (
+	"context"
+	"io"
+	"runtime"
+	"time"
+
+	"github.com/whatedcgveg/v2ray-core/app"
+	"github.com/whatedcgveg/v2ray-core/app/dispatcher"
+	"github.com/whatedcgveg/v2ray-core/app/log"
+	"github.com/whatedcgveg/v2ray-core/common"
+	"github.com/whatedcgveg/v2ray-core/common/buf"
+	"github.com/whatedcgveg/v2ray-core/common/net"
+	"github.com/whatedcgveg/v2ray-core/common/protocol"
+	"github.com/whatedcgveg/v2ray-core/common/signal"
+	"github.com/whatedcgveg/v2ray-core/proxy"
+	"github.com/whatedcgveg/v2ray-core/transport/internet"
+	"github.com/whatedcgveg/v2ray-core/transport/internet/udp"
+)
+
+// Server is a SOCKS 5 proxy server
+type Server struct {
+	config *ServerConfig
+}
+
+// NewServer creates a new Server object.
+func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
+	space := app.SpaceFromContext(ctx)
+	if space == nil {
+		return nil, newError("no space in context").AtWarning()
+	}
+	s := &Server{
+		config: config,
+	}
+	return s, nil
+}
+
+func (s *Server) Network() net.NetworkList {
+	list := net.NetworkList{
+		Network: []net.Network{net.Network_TCP},
+	}
+	if s.config.UdpEnabled {
+		list.Network = append(list.Network, net.Network_UDP)
+	}
+	return list
+}
+
+func (s *Server) Process(ctx context.Context, network net.Network, conn internet.Connection, dispatcher dispatcher.Interface) error {
+	switch network {
+	case net.Network_TCP:
+		return s.processTCP(ctx, conn, dispatcher)
+	case net.Network_UDP:
+		return s.handleUDPPayload(ctx, conn, dispatcher)
+	default:
+		return newError("unknown network: ", network)
+	}
+}
+
+func (s *Server) processTCP(ctx context.Context, conn internet.Connection, dispatcher dispatcher.Interface) error {
+	conn.SetReadDeadline(time.Now().Add(time.Second * 8))
+	reader := buf.NewBufferedReader(conn)
+
+	inboundDest, ok := proxy.InboundEntryPointFromContext(ctx)
+	if !ok {
+		return newError("inbound entry point not specified")
+	}
+	session := &ServerSession{
+		config: s.config,
+		port:   inboundDest.Port,
+	}
+
+	request, err := session.Handshake(reader, conn)
+	if err != nil {
+		if source, ok := proxy.SourceFromContext(ctx); ok {
+			log.Access(source, "", log.AccessRejected, err)
+		}
+		return newError("failed to read request").Base(err)
+	}
+	conn.SetReadDeadline(time.Time{})
+
+	if request.Command == protocol.RequestCommandTCP {
+		dest := request.Destination()
+		log.Trace(newError("TCP Connect request to ", dest))
+		if source, ok := proxy.SourceFromContext(ctx); ok {
+			log.Access(source, dest, log.AccessAccepted, "")
+		}
+
+		return s.transport(ctx, reader, conn, dest, dispatcher)
+	}
+
+	if request.Command == protocol.RequestCommandUDP {
+		return s.handleUDP()
+	}
+
+	return nil
+}
+
+func (*Server) handleUDP() error {
+	// The TCP connection closes after v method returns. We need to wait until
+	// the client closes it.
+	// TODO: get notified from UDP part
+	time.Sleep(5 * time.Minute)
+
+	return nil
+}
+
+func (v *Server) transport(ctx context.Context, reader io.Reader, writer io.Writer, dest net.Destination, dispatcher dispatcher.Interface) error {
+	timeout := time.Second * time.Duration(v.config.Timeout)
+	if timeout == 0 {
+		timeout = time.Minute * 5
+	}
+	ctx, timer := signal.CancelAfterInactivity(ctx, timeout)
+
+	ray, err := dispatcher.Dispatch(ctx, dest)
+	if err != nil {
+		return err
+	}
+
+	input := ray.InboundInput()
+	output := ray.InboundOutput()
+
+	requestDone := signal.ExecuteAsync(func() error {
+		defer input.Close()
+
+		v2reader := buf.NewReader(reader)
+		if err := buf.Copy(v2reader, input, buf.UpdateActivity(timer)); err != nil {
+			return newError("failed to transport all TCP request").Base(err)
+		}
+		return nil
+	})
+
+	responseDone := signal.ExecuteAsync(func() error {
+		v2writer := buf.NewWriter(writer)
+		if err := buf.Copy(output, v2writer, buf.UpdateActivity(timer)); err != nil {
+			return newError("failed to transport all TCP response").Base(err)
+		}
+		timer.SetTimeout(time.Second * 2)
+		return nil
+	})
+
+	if err := signal.ErrorOrFinish2(ctx, requestDone, responseDone); err != nil {
+		input.CloseError()
+		output.CloseError()
+		return newError("connection ends").Base(err)
+	}
+
+	runtime.KeepAlive(timer)
+
+	return nil
+}
+
+func (v *Server) handleUDPPayload(ctx context.Context, conn internet.Connection, dispatcher dispatcher.Interface) error {
+	udpServer := udp.NewDispatcher(dispatcher)
+
+	if source, ok := proxy.SourceFromContext(ctx); ok {
+		log.Trace(newError("client UDP connection from ", source))
+	}
+
+	reader := buf.NewReader(conn)
+	for {
+		mpayload, err := reader.Read()
+		if err != nil {
+			return err
+		}
+
+		for _, payload := range mpayload {
+			request, data, err := DecodeUDPPacket(payload.Bytes())
+
+			if err != nil {
+				log.Trace(newError("failed to parse UDP request").Base(err))
+				continue
+			}
+
+			if len(data) == 0 {
+				continue
+			}
+
+			log.Trace(newError("send packet to ", request.Destination(), " with ", len(data), " bytes").AtDebug())
+			if source, ok := proxy.SourceFromContext(ctx); ok {
+				log.Access(source, request.Destination, log.AccessAccepted, "")
+			}
+
+			dataBuf := buf.New()
+			dataBuf.Append(data)
+			udpServer.Dispatch(ctx, request.Destination(), dataBuf, func(payload *buf.Buffer) {
+				defer payload.Release()
+
+				log.Trace(newError("writing back UDP response with ", payload.Len(), " bytes").AtDebug())
+
+				udpMessage, err := EncodeUDPPacket(request, payload.Bytes())
+				defer udpMessage.Release()
+				if err != nil {
+					log.Trace(newError("failed to write UDP response").AtWarning().Base(err))
+				}
+
+				conn.Write(udpMessage.Bytes())
+			})
+		}
+	}
+}
+
+func init() {
+	common.Must(common.RegisterConfig((*ServerConfig)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
+		return NewServer(ctx, config.(*ServerConfig))
+	}))
+}

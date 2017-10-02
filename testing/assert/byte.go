@@ -1,0 +1,38 @@
+package assert
+
+import (
+	"github.com/whatedcgveg/v2ray-core/common/serial"
+)
+
+func (v *Assert) Byte(value byte) *ByteSubject {
+	return &ByteSubject{
+		Subject: Subject{
+			disp: serial.ByteToHexString(value),
+			a:    v,
+		},
+		value: value,
+	}
+}
+
+type ByteSubject struct {
+	Subject
+	value byte
+}
+
+func (subject *ByteSubject) Equals(expectation byte) {
+	if subject.value != expectation {
+		subject.Fail("is equal to", serial.ByteToHexString(expectation))
+	}
+}
+
+func (subject *ByteSubject) GreaterThan(expectation byte) {
+	if subject.value <= expectation {
+		subject.Fail("is greater than", serial.ByteToHexString(expectation))
+	}
+}
+
+func (subject *ByteSubject) LessThan(expectation byte) {
+	if subject.value >= expectation {
+		subject.Fail("is less than", serial.ByteToHexString(expectation))
+	}
+}

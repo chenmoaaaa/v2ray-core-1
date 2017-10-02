@@ -1,0 +1,118 @@
+package dokodemo
+
+//go:generate go run $GOPATH/src/github.com/whatedcgveg/v2ray-core/tools/generrorgen/main.go -pkg dokodemo -path Proxy,Dokodemo
+
+import (
+	"context"
+	"runtime"
+	"time"
+
+	"github.com/whatedcgveg/v2ray-core/app"
+	"github.com/whatedcgveg/v2ray-core/app/dispatcher"
+	"github.com/whatedcgveg/v2ray-core/app/log"
+	"github.com/whatedcgveg/v2ray-core/common"
+	"github.com/whatedcgveg/v2ray-core/common/buf"
+	"github.com/whatedcgveg/v2ray-core/common/net"
+	"github.com/whatedcgveg/v2ray-core/common/signal"
+	"github.com/whatedcgveg/v2ray-core/proxy"
+	"github.com/whatedcgveg/v2ray-core/transport/internet"
+)
+
+type DokodemoDoor struct {
+	config  *Config
+	address net.Address
+	port    net.Port
+}
+
+func New(ctx context.Context, config *Config) (*DokodemoDoor, error) {
+	space := app.SpaceFromContext(ctx)
+	if space == nil {
+		return nil, newError("no space in context")
+	}
+	if config.NetworkList == nil || config.NetworkList.Size() == 0 {
+		return nil, newError("no network specified")
+	}
+	d := &DokodemoDoor{
+		config:  config,
+		address: config.GetPredefinedAddress(),
+		port:    net.Port(config.Port),
+	}
+	return d, nil
+}
+
+func (d *DokodemoDoor) Network() net.NetworkList {
+	return *(d.config.NetworkList)
+}
+
+func (d *DokodemoDoor) Process(ctx context.Context, network net.Network, conn internet.Connection, dispatcher dispatcher.Interface) error {
+	log.Trace(newError("processing connection from: ", conn.RemoteAddr()).AtDebug())
+	dest := net.Destination{
+		Network: network,
+		Address: d.address,
+		Port:    d.port,
+	}
+	if d.config.FollowRedirect {
+		if origDest, ok := proxy.OriginalTargetFromContext(ctx); ok {
+			dest = origDest
+		}
+	}
+	if !dest.IsValid() || dest.Address == nil {
+		return newError("unable to get destination")
+	}
+
+	timeout := time.Second * time.Duration(d.config.Timeout)
+	if timeout == 0 {
+		timeout = time.Minute * 5
+	}
+	ctx, timer := signal.CancelAfterInactivity(ctx, timeout)
+
+	inboundRay, err := dispatcher.Dispatch(ctx, dest)
+	if err != nil {
+		return newError("failed to dispatch request").Base(err)
+	}
+
+	requestDone := signal.ExecuteAsync(func() error {
+		defer inboundRay.InboundInput().Close()
+
+		chunkReader := buf.NewReader(conn)
+
+		if err := buf.Copy(chunkReader, inboundRay.InboundInput(), buf.UpdateActivity(timer)); err != nil {
+			return newError("failed to transport request").Base(err)
+		}
+
+		return nil
+	})
+
+	responseDone := signal.ExecuteAsync(func() error {
+		var writer buf.Writer
+		if network == net.Network_TCP {
+			writer = buf.NewWriter(conn)
+		} else {
+			writer = buf.NewSequentialWriter(conn)
+		}
+
+		if err := buf.Copy(inboundRay.InboundOutput(), writer, buf.UpdateActivity(timer)); err != nil {
+			return newError("failed to transport response").Base(err)
+		}
+
+		timer.SetTimeout(time.Second * 2)
+
+		return nil
+	})
+
+	if err := signal.ErrorOrFinish2(ctx, requestDone, responseDone); err != nil {
+		inboundRay.InboundInput().CloseError()
+		inboundRay.InboundOutput().CloseError()
+		return newError("connection ends").Base(err)
+	}
+
+	runtime.KeepAlive(timer)
+
+	return nil
+}
+
+func init() {
+	common.Must(common.RegisterConfig((*Config)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
+		return New(ctx, config.(*Config))
+	}))
+}
